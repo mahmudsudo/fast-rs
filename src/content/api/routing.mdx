@@ -1,0 +1,215 @@
+---
+title: Routing and route macros
+---
+
+fastrs provides five attribute macros that turn async handler functions into route definitions. Each macro pairs an HTTP method with a path pattern, generates OpenAPI metadata from the handler's extractors and return type, and produces a `RouteDef` value that you register on the app with `App::route`.
+
+## Route attribute macros
+
+Use `#[get(path)]`, `#[post(path)]`, `#[put(path)]`, `#[patch(path)]`, or `#[delete(path)]` on an async function:
+
+```rust
+use fastrs::{get, post, put, patch, delete, Json, NoContent, Path};
+
+#[get("/items/{id}")]
+async fn get_item(Path(id): Path<u64>) -> Json<String> {
+    Json(format!("item {}", id))
+}
+
+#[post("/items")]
+async fn create_item(body: Json<CreateItemRequest>) -> Json<ItemResponse> {
+    // ...
+}
+
+#[put("/items/{id}")]
+async fn replace_item(Path(id): Path<u64>, body: Json<CreateItemRequest>) -> Json<ItemResponse> {
+    // ...
+}
+
+#[patch("/items/{id}")]
+async fn update_item(Path(id): Path<u64>, body: Json<UpdateItemRequest>) -> Json<ItemResponse> {
+    // ...
+}
+
+#[delete("/items/{id}")]
+async fn delete_item(Path(id): Path<u64>) -> NoContent {
+    // ...
+}
+```
+
+Each macro accepts a single string-literal path. Path parameters use brace syntax, for example `"/items/{id}"`.
+
+## Registering routes
+
+Pass the generated function name (without calling it) to `App::route`:
+
+```rust
+use fastrs::App;
+
+let app = App::new()
+    .route(get_item)
+    .route(create_item)
+    .route(replace_item)
+    .route(update_item)
+    .route(delete_item);
+```
+
+`App::route` accepts `fn() -> RouteDef<S>`, the exact signature every route macro produces.
+
+## `RouteDef` struct
+
+Each route macro expands into a function that returns a `RouteDef`:
+
+```rust
+pub struct RouteDef<S = ()> {
+    pub path: &'static str,
+    pub method: Method,
+    pub router: MethodRouter<S>,
+    pub operation: Operation,
+}
+```
+
+| Field | Type | Purpose |
+|---|---|---|
+| `path` | `&'static str` | The original path string from the macro attribute, for example `"/items/{id}"`. |
+| `method` | `Method` | HTTP method enum variant. |
+| `router` | `MethodRouter<S>` | The underlying axum method router that dispatches the handler. |
+| `operation` | `Operation` | OpenAPI operation metadata collected from the handler's extractors and return type. |
+
+## `Method` enum
+
+```rust
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+```
+
+The macro selects the matching variant automatically.
+
+## Path parameter conversion
+
+Paths in fastrs use brace syntax (`{param}`), while axum uses colon syntax (`:param`). When you call `App::route`, fastrs automatically converts each `{param}` segment to `:param` before registering the route with axum. You always write brace syntax in your macro attribute:
+
+```rust
+#[get("/users/{user_id}/posts/{post_id}")]
+async fn get_post(Path((user_id, post_id)): Path<(u64, u64)>) -> Json<PostResponse> {
+    // fastrs registers this with axum as /users/:user_id/posts/:post_id
+    // ...
+}
+```
+
+## What the macro generates
+
+Each route macro transforms the annotated function through several steps:
+
+1. **Renames the handler.** The original function body is moved into an inner function named `__fastrs_inner_<original_name>`. The original name becomes a public function that returns `RouteDef<S>`.
+
+2. **Detects extractors and wires OpenAPI metadata.**
+   - `Path<T>` parameters are recorded as required path parameters in the OpenAPI operation, with the schema derived from `T`.
+   - All other extractors (such as `Json<T>`, `Query<T>`, `Page`, `Bearer<T>`, `Header<T, V>`, `Multipart`) are wired by calling their `OpenApiExtractor::modify_operation` implementation.
+
+3. **Wires the return type.** If the return type is a concrete type (not `impl Trait`), the macro calls `OpenApiResponder::modify_operation` for it, populating the operation's response schemas.
+
+4. **Determines the state type parameter.**
+   - If any parameter uses `State<T>`, the generated function returns `RouteDef<T>` with a concrete state type.
+   - If no `State` extractor is present, the function is generic: `fn name<S>() -> RouteDef<S>` where `S: Clone + Send + Sync + 'static`.
+
+5. **Adds `AuthVerifier` bounds.** If any parameter uses `Bearer<T>`, the generated function adds a `S: AuthVerifier<T>` trait bound so the app state must implement token verification.
+
+### Expansion example
+
+Given this handler:
+
+```rust
+use fastrs::{get, Json, Path};
+
+#[get("/users/{id}")]
+async fn get_user(Path(id): Path<u64>) -> Json<UserResponse> {
+    Json(UserResponse { id, email: "x@y.com".into() })
+}
+```
+
+The macro produces roughly:
+
+```rust
+pub fn get_user<S>() -> fastrs::RouteDef<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    async fn __fastrs_inner_get_user(Path(id): Path<u64>) -> Json<UserResponse> {
+        Json(UserResponse { id, email: "x@y.com".into() })
+    }
+
+    let mut op = fastrs::Operation::default();
+
+    // Path<u64> → add "id" as a required path parameter
+    op.parameters.push(fastrs::Parameter {
+        name: "id".to_string(),
+        in_: "path".to_string(),
+        required: true,
+        schema: <u64 as fastrs::OpenApiType>::schema(),
+    });
+
+    // Json<UserResponse> → document response schema
+    <Json<UserResponse> as fastrs::OpenApiResponder>::modify_operation(&mut op);
+
+    fastrs::RouteDef {
+        path: "/users/{id}",
+        method: fastrs::Method::Get,
+        router: fastrs::axum::routing::get(__fastrs_inner_get_user),
+        operation: op,
+    }
+}
+```
+
+### Expansion with state
+
+When a handler uses `State<T>`, the return type is pinned to that state:
+
+```rust
+use fastrs::{get, Json, State};
+
+#[derive(Clone)]
+struct AppState { db: String }
+
+#[get("/status")]
+async fn status(State(state): State<AppState>) -> Json<String> {
+    Json(state.db.clone())
+}
+
+// Macro output: fn status() -> RouteDef<AppState>
+// (no generic S, concrete AppState)
+```
+
+Register it after providing the state:
+
+```rust
+let app = App::new()
+    .route(status)
+    .with_state(AppState { db: "postgres://...".into() });
+```
+
+### Expansion with Bearer authentication
+
+When a handler uses `Bearer<T>`, the generated function requires `S: AuthVerifier<T>`:
+
+```rust
+use fastrs::{get, Json, Bearer};
+
+#[get("/me")]
+async fn me(Bearer(user_id): Bearer<String>) -> Json<String> {
+    Json(user_id)
+}
+
+// Macro output:
+// fn me<S>() -> RouteDef<S>
+// where
+//     S: Clone + Send + Sync + 'static,
+//     S: AuthVerifier<String>,
+```
+
+The app state must implement `AuthVerifier<String>` for this route to compile.

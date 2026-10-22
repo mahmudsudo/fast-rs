@@ -1,0 +1,190 @@
+---
+title: Error handling
+description: Return structured JSON errors with ApiError, map application errors with IntoApiError, and generate OpenAPI error documentation automatically.
+---
+
+`ApiError` is the built-in error enum for fastrs handlers. Each variant maps to an HTTP status code and serializes to a consistent JSON shape. When used as the `E` in `Result<T, E>`, it also contributes error responses to the generated OpenAPI spec.
+
+## ApiError variants
+
+```rust
+pub enum ApiError {
+    NotFound(String),
+    Unauthorized(String),
+    BadRequest(String),
+    InternalServerError(String),
+    Validation(ValidationErrors),
+    Custom(StatusCode, String),
+}
+```
+
+| Variant | Status code | JSON body |
+|---|---|---|
+| `NotFound(msg)` | 404 | `{"message": "..."}` |
+| `Unauthorized(msg)` | 401 | `{"message": "..."}` |
+| `BadRequest(msg)` | 400 | `{"message": "..."}` |
+| `InternalServerError(msg)` | 500 | `{"message": "..."}` |
+| `Validation(errors)` | 422 | `{"errors": [{"field": "...", "message": "..."}]}` |
+| `Custom(status, msg)` | any | `{"message": "..."}` |
+
+All variants except `Validation` produce a body with a single `message` field. `Validation` omits `message` and instead returns an `errors` array with per-field details. Both fields are skipped when `None`, so the two shapes never mix.
+
+## Returning errors from handlers
+
+Return `Result<T, ApiError>` from a handler to use the built-in error type directly:
+
+```rust
+use fastrs::{get, ApiError, Json, Path};
+
+#[get("/users/{id}")]
+async fn get_user(Path(id): Path<u32>) -> Result<Json<String>, ApiError> {
+    if id == 0 {
+        return Err(ApiError::NotFound("User not found".to_string()));
+    }
+    Ok(Json(format!("user-{}", id)))
+}
+```
+
+A `404` response with `{"message":"User not found"}` is returned when the condition is met.
+
+## Validation errors
+
+The `Json<T>` and `Query<T>` extractors call `Validate::validate()` after deserialization. When validation fails, fastrs returns a `422` response. Each failing field produces an entry in the `errors` array:
+
+```json
+{
+  "errors": [
+    { "field": "email", "message": "validation failed: email" },
+    { "field": "name", "message": "name must not be empty" }
+  ]
+}
+```
+
+If a validator rule has a custom `message` attribute, that message is used. Otherwise the response falls back to `"validation failed: <code>"`.
+
+## Custom errors with `IntoApiError`
+
+Application-specific errors rarely map to `ApiError` directly. The `IntoApiError` trait bridges the gap:
+
+```rust
+pub trait IntoApiError {
+    fn into_api_error(self) -> ApiError;
+}
+```
+
+A blanket `From` implementation converts any `IntoApiError` type into `ApiError`, so the `?` operator works in handlers that return `Result<T, ApiError>`:
+
+```rust
+use fastrs::{ApiError, IntoApiError};
+
+struct DbError(String);
+
+impl IntoApiError for DbError {
+    fn into_api_error(self) -> ApiError {
+        ApiError::InternalServerError(self.0)
+    }
+}
+```
+
+With this implementation, `db_call().map_err(|e| DbError(e.to_string()))?` propagates the error as a `500` response.
+
+## AppError wrapper pattern
+
+When a handler must convert errors from multiple sources (for example, both database errors and validation errors), wrap `ApiError` in a newtype. This pattern is used in the `todo_sql` example:
+
+```rust
+use fastrs::{ApiError, OpenApiResponder, Operation};
+
+#[derive(Debug)]
+pub struct AppError(pub ApiError);
+
+// Convert database errors
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        match err {
+            sqlx::Error::RowNotFound => {
+                AppError(ApiError::NotFound("Not found".to_string()))
+            }
+            _ => AppError(ApiError::InternalServerError(err.to_string())),
+        }
+    }
+}
+
+// Allow constructing from ApiError directly
+impl From<ApiError> for AppError {
+    fn from(err: ApiError) -> Self {
+        AppError(err)
+    }
+}
+
+// Delegate the HTTP response to ApiError
+impl axum::response::IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        self.0.into_response()
+    }
+}
+
+// Delegate OpenAPI documentation to ApiError
+impl OpenApiResponder for AppError {
+    fn modify_operation(op: &mut Operation) {
+        ApiError::modify_operation(op);
+    }
+}
+```
+
+Handlers then return `Result<T, AppError>` and use `?` for both database calls and explicit `ApiError` construction:
+
+```rust
+use fastrs::{get, Json, Path};
+
+#[get("/todos/{id}")]
+async fn get_todo(
+    Path(id): Path<i64>,
+    axum::extract::State(pool): axum::extract::State<sqlx::SqlitePool>,
+) -> Result<Json<TodoResponse>, AppError> {
+    let row: Option<(i64, String, i64)> =
+        sqlx::query_as("SELECT id, title, done FROM todos WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?; // sqlx::Error -> AppError via From
+
+    if let Some((row_id, title, done)) = row {
+        Ok(Json(TodoResponse {
+            id: row_id,
+            title,
+            done: done != 0,
+        }))
+    } else {
+        Err(AppError(ApiError::NotFound(
+            format!("Todo {} not found", id),
+        )))
+    }
+}
+```
+
+## OpenAPI error documentation
+
+`ApiError` implements `OpenApiResponder`. When a route returns `Result<T, ApiError>` (or a wrapper that delegates to it), the generated OpenAPI spec includes:
+
+- A `4XX` response with description "Client Error" and a JSON schema containing a `message` string.
+- A `5XX` response with description "Server Error" and the same schema.
+
+The `Result<T, E>` implementation calls `T::modify_operation` for success responses and `E::modify_operation` for error responses, so both are documented in a single operation.
+
+## Response types
+
+The full JSON envelope types used internally:
+
+```rust
+pub struct ErrorResponse {
+    pub message: Option<String>,
+    pub errors: Option<Vec<FieldError>>,
+}
+
+pub struct FieldError {
+    pub field: String,
+    pub message: String,
+}
+```
+
+`message` is included for all variants except `Validation`. `errors` is included only for `Validation`. Null fields are omitted from the serialized JSON.

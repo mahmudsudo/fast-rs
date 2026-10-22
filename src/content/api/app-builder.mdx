@@ -1,0 +1,312 @@
+---
+title: App builder
+description: "Build and configure a fastrs application with routes, middleware, shared state, and auto-generated API docs."
+---
+
+`App<S>` is the central type for assembling a fastrs application. It wraps an Axum `Router<S>` and an `OpenApi` registry so that every route you add is reflected in both the HTTP server and the generated OpenAPI spec.
+
+```rust
+pub struct App<S = ()> {
+    router: Router<S>,
+    pub openapi: OpenApi,
+}
+```
+
+All builder methods on `App<S>` require `S: Clone + Send + Sync + 'static`. When no shared state is needed, use the default `App<()>`.
+
+## Create an application
+
+`App::new()` returns an empty application with no routes and a default OpenAPI registry (spec version 3.0.3, title "fastrs API").
+
+```rust
+use fastrs::App;
+
+let app = App::new();
+```
+
+## Register routes
+
+Pass a route-definition function (typically produced by the `#[get]`, `#[post]`, `#[put]`, `#[patch]`, or `#[delete]` attribute macros) to `route()`. The route is added to the Axum router and its OpenAPI operation is inserted into the spec.
+
+```rust
+use fastrs::{App, get};
+
+#[get("/hello")]
+async fn hello() -> &'static str {
+    "Hello, world!"
+}
+
+let app = App::new().route(hello);
+```
+
+Path parameters written as `{id}` in the macro are converted to Axum's `:id` format automatically.
+
+### Signature
+
+```rust
+pub fn route(self, route_def: fn() -> RouteDef<S>) -> Self
+```
+
+## Nest sub-applications
+
+`nest()` mounts another `App<S>` under a path prefix and merges its OpenAPI paths.
+
+```rust
+let users_app = App::new().route(list_users).route(get_user);
+let app = App::new().nest("/api/v1", users_app);
+```
+
+### Signature
+
+```rust
+pub fn nest(self, path: &str, app: App<S>) -> Self
+```
+
+## Provide shared state
+
+`with_state()` finalizes the state type, returning an `App<()>` that is ready to run or receive stateless middleware.
+
+```rust
+#[derive(Clone)]
+struct DbPool { /* ... */ }
+
+let app = App::new()
+    .route(create_item)
+    .with_state(DbPool { /* ... */ });
+```
+
+### Signature
+
+```rust
+pub fn with_state(self, state: S) -> App<()>
+```
+
+## Add middleware
+
+### Generic layer
+
+`layer()` accepts any Tower `Layer` that satisfies the Axum service bounds. All built-in middleware presets delegate to this method.
+
+```rust
+use tower_http::compression::CompressionLayer;
+
+let app = App::new()
+    .route(my_handler)
+    .layer(CompressionLayer::new());
+```
+
+#### Signature
+
+```rust
+pub fn layer<L>(self, layer: L) -> Self
+```
+
+### CORS
+
+Convenience wrapper that passes a `CorsLayer` to `layer()`.
+
+```rust
+use tower_http::cors::CorsLayer;
+
+let app = App::new()
+    .route(my_handler)
+    .with_cors(CorsLayer::permissive());
+```
+
+#### Signature
+
+```rust
+pub fn with_cors(self, layer: CorsLayer) -> Self
+```
+
+### Tracing
+
+Convenience wrapper that passes a `TraceLayer` to `layer()`.
+
+```rust
+use tower_http::trace::TraceLayer;
+
+let app = App::new()
+    .route(my_handler)
+    .with_tracing(TraceLayer::new_for_http());
+```
+
+#### Signature
+
+```rust
+pub fn with_tracing<L>(self, layer: TraceLayer<L>) -> Self
+```
+
+### Rate limiting
+
+Creates a `RateLimitLayer` from the provided config and adds it via `layer()`. When the limit is exceeded the server responds with `429 Too Many Requests`.
+
+The limiter uses a single global bucket (all requests share one counter regardless of client identity).
+
+```rust
+use std::time::Duration;
+use fastrs::RateLimitConfig;
+
+let app = App::new()
+    .route(my_handler)
+    .with_rate_limit(RateLimitConfig::new(100, Duration::from_secs(60)));
+```
+
+`max_requests` sets both the bucket capacity and the refill token count. `window` sets the refill interval.
+
+#### Signature
+
+```rust
+pub fn with_rate_limit(self, config: RateLimitConfig) -> Self
+```
+
+### Request ID
+
+Adds `SetRequestIdLayer` and `PropagateRequestIdLayer` from `tower-http`. A UUID v4 `x-request-id` header is generated for each incoming request (unless one is already present) and propagated to the response.
+
+```rust
+let app = App::new()
+    .route(my_handler)
+    .with_request_id();
+```
+
+#### Signature
+
+```rust
+pub fn with_request_id(self) -> Self
+```
+
+## Health checks
+
+### Basic health check
+
+Registers a GET endpoint that returns `200 OK` with a JSON body containing `status` and `version` (the `CARGO_PKG_VERSION` of `fastrs-core`).
+
+```rust
+let app = App::new()
+    .route(my_handler)
+    .health_check("/health");
+```
+
+Response body:
+
+```json
+{"status": "ok", "version": "0.1.0"}
+```
+
+#### Signature
+
+```rust
+pub fn health_check(self, path: &'static str) -> Self
+```
+
+### Custom health check
+
+Registers a GET endpoint that calls `check_fn` on every request. `Ok(())` produces a `200 OK` response. `Err(msg)` produces a `503 Service Unavailable` response with the error message.
+
+```rust
+let app = App::new()
+    .route(my_handler)
+    .health_check_with("/health", || async {
+        db_ping().await.map_err(|e| e.to_string())
+    });
+```
+
+#### Signature
+
+```rust
+pub fn health_check_with<F, Fut>(self, path: &'static str, check_fn: F) -> Self
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), String>> + Send,
+```
+
+## Serve OpenAPI docs
+
+`serve_docs_at()` serializes the current OpenAPI spec to JSON and mounts two GET endpoints:
+
+- `path` returns an HTML page with embedded Swagger UI.
+- `{path}/openapi.json` returns the raw OpenAPI JSON.
+
+Call this after all routes have been registered so the spec is complete.
+
+```rust
+let app = App::new()
+    .route(list_users)
+    .route(create_user)
+    .serve_docs_at("/docs");
+```
+
+### Signature
+
+```rust
+pub fn serve_docs_at(self, path: &'static str) -> Self
+```
+
+## Extract the inner router
+
+`into_router()` returns the underlying Axum `Router<S>`, which is useful for testing or manual composition.
+
+```rust
+let router = App::new()
+    .route(my_handler)
+    .into_router();
+```
+
+### Signature
+
+```rust
+pub fn into_router(self) -> Router<S>
+```
+
+## Run the server
+
+`run()` is available only on `App<()>` (after calling `with_state()` or when no state is needed). It binds a TCP listener to `addr` and starts the Axum server with graceful shutdown.
+
+The server listens for SIGINT on all platforms and SIGTERM on Unix. In-flight requests are allowed to complete before the process exits.
+
+```rust
+#[tokio::main]
+async fn main() {
+    App::new()
+        .route(hello)
+        .health_check("/health")
+        .run("0.0.0.0:3000")
+        .await;
+}
+```
+
+### Signature
+
+```rust
+// impl App<()>
+pub async fn run(self, addr: &str)
+```
+
+## Full example
+
+```rust
+use std::time::Duration;
+use fastrs::{App, get, RateLimitConfig};
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+
+#[get("/hello")]
+async fn hello() -> &'static str {
+    "Hello!"
+}
+
+#[tokio::main]
+async fn main() {
+    App::new()
+        .route(hello)
+        .with_cors(CorsLayer::permissive())
+        .with_tracing(TraceLayer::new_for_http())
+        .with_rate_limit(RateLimitConfig::new(200, Duration::from_secs(60)))
+        .with_request_id()
+        .health_check("/health")
+        .serve_docs_at("/docs")
+        .run("0.0.0.0:3000")
+        .await;
+}
+```
