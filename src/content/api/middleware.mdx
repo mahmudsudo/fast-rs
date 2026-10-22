@@ -1,0 +1,155 @@
+---
+title: Middleware
+description: "Add CORS, tracing, rate limiting, request IDs, and custom Tower layers to a fastrs application."
+---
+
+fastrs provides convenience methods for common middleware and a generic `layer()` method that accepts any Tower layer. Every convenience method delegates to `layer()` internally.
+
+## Layer ordering
+
+Axum layers wrap routes that were registered _before_ the layer call. A layer added after a route wraps that route; a route added after a layer is not wrapped by it.
+
+```rust
+let app = App::new()
+    .route(public_handler)       // rate-limited
+    .with_rate_limit(config)
+    .route(protected_handler);   // not rate-limited
+```
+
+When you stack multiple layers, the last layer added is the outermost (first to run on each request).
+
+## Generic layer
+
+`layer()` accepts any Tower `Layer` that satisfies the Axum service bounds. Use it when fastrs does not offer a named preset for the middleware you need.
+
+```rust
+use tower_http::compression::CompressionLayer;
+
+let app = App::new()
+    .route(my_handler)
+    .layer(CompressionLayer::new());
+```
+
+### Signature
+
+```rust
+pub fn layer<L>(self, layer: L) -> Self
+```
+
+## CORS
+
+`with_cors()` is a convenience wrapper that passes a `CorsLayer` to `layer()`.
+
+```rust
+use tower_http::cors::CorsLayer;
+
+let app = App::new()
+    .route(my_handler)
+    .with_cors(CorsLayer::permissive());
+```
+
+You can configure the layer with specific origins, methods, and headers using the `CorsLayer` builder before passing it in.
+
+### Signature
+
+```rust
+pub fn with_cors(self, layer: CorsLayer) -> Self
+```
+
+## Tracing
+
+`with_tracing()` is a convenience wrapper that passes a `TraceLayer` to `layer()`. The layer comes from tower-http and emits tracing spans for each request/response cycle.
+
+```rust
+use tower_http::trace::TraceLayer;
+
+let app = App::new()
+    .route(my_handler)
+    .with_tracing(TraceLayer::new_for_http());
+```
+
+### Signature
+
+```rust
+pub fn with_tracing<L>(self, layer: TraceLayer<L>) -> Self
+```
+
+## Rate limiting
+
+`with_rate_limit()` creates a `RateLimitLayer` from a `RateLimitConfig` and adds it via `layer()`. When the limit is exceeded the server responds with `429 Too Many Requests`.
+
+```rust
+use std::time::Duration;
+use fastrs::RateLimitConfig;
+
+let app = App::new()
+    .route(my_handler)
+    .with_rate_limit(RateLimitConfig::new(100, Duration::from_secs(60)));
+```
+
+### `RateLimitConfig`
+
+```rust
+pub struct RateLimitConfig {
+    pub max_requests: u32,
+    pub window: Duration,
+}
+
+impl RateLimitConfig {
+    pub fn new(max_requests: u32, window: Duration) -> Self
+}
+```
+
+`max_requests` sets both the token-bucket capacity and the refill token count in the underlying `rate_rs::RateLimiter`. `window` sets the refill interval.
+
+The limiter uses an in-memory store (`rate_rs::InMemoryStore`) with a single global bucket keyed to `"global"`. All requests share one counter regardless of client IP or identity. If you need per-client limiting, use `layer()` with a custom Tower layer instead.
+
+### Signature
+
+```rust
+pub fn with_rate_limit(self, config: RateLimitConfig) -> Self
+```
+
+## Request ID
+
+`with_request_id()` adds two tower-http layers: `SetRequestIdLayer` generates a UUID v4 `x-request-id` header for each incoming request (unless one is already present), and `PropagateRequestIdLayer` copies that header to the response.
+
+```rust
+let app = App::new()
+    .route(my_handler)
+    .with_request_id();
+```
+
+### Signature
+
+```rust
+pub fn with_request_id(self) -> Self
+```
+
+## Full example
+
+```rust
+use std::time::Duration;
+use fastrs::{App, get, RateLimitConfig};
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+
+#[get("/hello")]
+async fn hello() -> &'static str {
+    "Hello!"
+}
+
+#[tokio::main]
+async fn main() {
+    App::new()
+        .route(hello)
+        .with_cors(CorsLayer::permissive())
+        .with_tracing(TraceLayer::new_for_http())
+        .with_rate_limit(RateLimitConfig::new(200, Duration::from_secs(60)))
+        .with_request_id()
+        .run("0.0.0.0:3000")
+        .await;
+}
+```
+
+All four middleware layers wrap the `hello` route because they are added after it. The request-ID layer is outermost (runs first), followed by rate limiting, tracing, and CORS.

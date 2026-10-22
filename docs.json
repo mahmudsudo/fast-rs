@@ -23,46 +23,49 @@
   },
   "tabs": [
     {
-      "tab": "Get started",
-      "groups": [
-        {
-          "group": "Get started",
-          "pages": ["introduction", "quickstart"]
-        },
-        {
-          "group": "Design your docs",
-          "pages": ["components", "customization"]
-        }
-      ]
-    },
-    {
-      "tab": "Guides",
-      "groups": [
-        {
-          "group": "Work with Thally",
-          "pages": [
-            "guides/create-a-site",
-            "guides/work-with-the-cli",
-            "guides/connect-ai-tools"
-          ]
-        }
-      ]
-    },
-    {
-      "tab": "API Reference",
+      "tab": "Documentation",
       "groups": [
         {
           "group": "Overview",
-          "pages": ["api/introduction", "api/authentication"]
+          "pages": [
+            "introduction"
+          ]
+        },
+        {
+          "group": "Getting Started",
+          "pages": [
+            "quickstart"
+          ]
+        },
+        {
+          "group": "API Reference",
+          "pages": [
+            "api/app-builder",
+            "api/routing",
+            "api/openapi",
+            "api/extractors",
+            "api/authentication",
+            "api/error-handling",
+            "api/responses",
+            "api/middleware",
+            "api/htmx"
+          ]
+        },
+        {
+          "group": "Guides",
+          "pages": [
+            "guides/state-and-database",
+            "guides/health-checks-and-versioning",
+            "guides/deployment"
+          ]
+        },
+        {
+          "group": "Reference",
+          "pages": [
+            "changelog"
+          ]
         }
-      ],
-      "api": {
-        "source": "openapi.yaml"
-      }
-    },
-    {
-      "tab": "Changelog",
-      "href": "/changelog"
+      ]
     }
   ]
 }

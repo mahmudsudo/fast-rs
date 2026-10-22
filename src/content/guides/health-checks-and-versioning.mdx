@@ -1,0 +1,159 @@
+---
+title: Health checks and API versioning
+description: "Add health check endpoints and organize versioned APIs using route nesting."
+---
+
+## Health checks
+
+`App` provides two methods for registering health check endpoints. Both add a plain Axum GET route, so health check paths do not appear in the generated OpenAPI spec.
+
+### Basic health check
+
+`health_check` returns a fixed JSON response with HTTP 200:
+
+```rust
+let app = App::new()
+    .route(list_items)
+    .health_check("/health");
+```
+
+A GET request to `/health` returns:
+
+```json
+{"status": "ok", "version": "0.1.0"}
+```
+
+The `version` value comes from the `CARGO_PKG_VERSION` of the `fastrs-core` crate at compile time, not from your application's `Cargo.toml`.
+
+### Custom health check
+
+`health_check_with` accepts an async function that runs on every request. Return `Ok(())` for a healthy response or `Err(message)` for an unhealthy one:
+
+```rust
+let app = App::new()
+    .route(list_items)
+    .health_check_with("/health", || async {
+        db_ping().await.map_err(|e| e.to_string())
+    });
+```
+
+When the check succeeds the response is the same 200 body as the basic variant. When it fails the server responds with 503 Service Unavailable:
+
+```json
+{"status": "error", "message": "database connection timed out"}
+```
+
+### Multiple health endpoints
+
+You can register more than one health check on the same app. A common pattern is a lightweight liveness probe and a deeper readiness probe:
+
+```rust
+let app = App::new()
+    .route(list_items)
+    .health_check("/healthz")
+    .health_check_with("/ready", || async {
+        db_ping().await.map_err(|e| e.to_string())
+    });
+```
+
+## API versioning with `nest`
+
+`nest` mounts one `App` inside another at a path prefix. The nested app's routes and OpenAPI operations are merged into the parent, with each path prefixed automatically.
+
+### Single version
+
+If all your routes belong to one API version, nest them under a common prefix:
+
+```rust
+use fastrs::{App, get, post, Json, OpenApi};
+use serde::Deserialize;
+use validator::Validate;
+
+#[derive(Deserialize, Validate, OpenApi)]
+struct NewItem {
+    name: String,
+}
+
+#[get("/items")]
+async fn list_items() -> Json<Vec<String>> {
+    Json(vec![])
+}
+
+#[post("/items")]
+async fn create_item(body: Json<NewItem>) -> Json<String> {
+    Json(body.name.clone())
+}
+
+let v1 = App::new()
+    .route(list_items)
+    .route(create_item);
+
+let app = App::new()
+    .nest("/api/v1", v1)
+    .health_check("/health")
+    .serve_docs_at("/docs");
+```
+
+Requests hit `/api/v1/items`. The OpenAPI spec served at `/docs` lists paths as `/api/v1/items` with their full operations.
+
+### Multiple versions
+
+Build a separate `App` for each version and nest them into a root app:
+
+```rust
+let v1 = App::new()
+    .route(list_items_v1)
+    .route(create_item_v1);
+
+let v2 = App::new()
+    .route(list_items_v2)
+    .route(create_item_v2);
+
+let app = App::new()
+    .nest("/api/v1", v1)
+    .nest("/api/v2", v2)
+    .health_check("/health")
+    .serve_docs_at("/docs");
+```
+
+Both sets of paths appear in the generated OpenAPI spec with their respective prefixes (`/api/v1/items`, `/api/v2/items`).
+
+### How path merging works
+
+When `nest` merges OpenAPI paths it concatenates the mount prefix with each sub-app path. A sub-app route at `/` becomes the prefix itself:
+
+```rust
+// Route defined as #[get("/")]
+// Nested at "/api/v1"
+// Final OpenAPI path: /api/v1
+```
+
+For any other path the prefix and path are joined directly:
+
+```rust
+// Route defined as #[get("/items")]
+// Nested at "/api/v1"
+// Final OpenAPI path: /api/v1/items
+```
+
+### Shared state across versions
+
+If versioned sub-apps share state, call `with_state` on the root app after nesting:
+
+```rust
+#[derive(Clone)]
+struct AppState {
+    db: DatabasePool,
+}
+
+let v1 = App::new().route(list_items_v1);
+let v2 = App::new().route(list_items_v2);
+
+let app = App::new()
+    .nest("/api/v1", v1)
+    .nest("/api/v2", v2)
+    .health_check("/health")
+    .with_state(AppState { db: pool })
+    .run("0.0.0.0:8000")
+    .await;
+```

@@ -1,0 +1,178 @@
+---
+title: Extractors
+description: Parse and validate request data with built-in extractors that integrate with OpenAPI documentation.
+---
+
+Extractors pull typed data from incoming requests. Each extractor validates its input and returns a structured error when validation fails. Most extractors also implement `OpenApiExtractor`, so routes registered with `App::route` automatically document their parameters and request bodies.
+
+## `Json<T>`
+
+Deserializes a JSON request body into `T` and runs validation. `T` must implement `DeserializeOwned` and `Validate`.
+
+When deserialization succeeds but validation fails, the extractor returns a **422** response with field-level error details. When used as a return type it sets the OpenAPI response schema for status 200.
+
+```rust
+use fastrs::Json;
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Deserialize, Serialize, Validate)]
+struct CreateUser {
+    #[validate(email)]
+    email: String,
+}
+
+async fn create_user(Json(user): Json<CreateUser>) -> Json<CreateUser> {
+    Json(user)
+}
+```
+
+**OpenAPI integration:** sets `requestBody` with an `application/json` media type and the schema derived from `T`. When used as a response type, documents a `200` response with the same schema.
+
+## `Path<T>`
+
+Extracts URL path parameters. `T` must implement `DeserializeOwned`. Delegates directly to `axum::extract::Path`.
+
+```rust
+use fastrs::Path;
+
+async fn get_user(Path(id): Path<u32>) -> String {
+    format!("User {}", id)
+}
+```
+
+Path parameters are added to the OpenAPI operation automatically by the route attribute macros (`#[get]`, `#[post]`, etc.) rather than by the extractor itself.
+
+## `Query<T>`
+
+Parses query string parameters into `T` and validates them. `T` must implement `DeserializeOwned` and `Validate`. Returns **422** on validation failure.
+
+```rust
+use fastrs::Query;
+use serde::Deserialize;
+use validator::Validate;
+
+#[derive(Deserialize, Validate)]
+struct SearchParams {
+    q: Option<String>,
+    #[validate(range(min = 1))]
+    max_results: Option<u32>,
+}
+
+async fn search(Query(params): Query<SearchParams>) -> String {
+    format!("Searching for {:?}", params.q)
+}
+```
+
+**OpenAPI integration:** each field of `T` becomes a query parameter. Fields listed in the schema's `required` set are marked required; the rest are optional.
+
+## `Page`
+
+A convenience extractor for paginated endpoints. Reads `page` and `limit` from the query string.
+
+| Parameter | Default | Constraint |
+|-----------|---------|------------|
+| `page` | `1` | Must be greater than 0; returns **400** otherwise |
+| `limit` | `20` | Must be greater than 0; returns **400** otherwise |
+
+```rust
+use fastrs::Page;
+
+async fn list_items(page: Page) -> String {
+    format!("page={}, limit={}", page.page, page.limit)
+}
+```
+
+**OpenAPI integration:** adds two optional integer query parameters (`page` and `limit`).
+
+## `Header<T, V>`
+
+Extracts and parses a single request header. `T` implements `HeaderName` to identify which header to read; `V` (defaults to `String`) must implement `FromStr`. Returns **400** when the header is missing or cannot be parsed.
+
+```rust
+use fastrs::{Header, HeaderName};
+
+struct XRequestSource;
+
+impl HeaderName for XRequestSource {
+    fn name() -> &'static str {
+        "x-request-source"
+    }
+}
+
+async fn handle(header: Header<XRequestSource, String>) -> String {
+    format!("Request from: {}", *header)
+}
+```
+
+### The `HeaderName` trait
+
+Implement this trait on a zero-sized type to associate it with a header name:
+
+```rust
+pub trait HeaderName: Send + Sync {
+    fn name() -> &'static str;
+}
+```
+
+**OpenAPI integration:** adds a required header parameter with the schema of `V`.
+
+## `Multipart`
+
+Wraps `axum::extract::Multipart` for file uploads and mixed payloads. Returns **400** when the multipart stream cannot be parsed.
+
+Access fields by iterating with `next_field().await`:
+
+```rust
+use fastrs::Multipart;
+
+async fn upload(mut multipart: Multipart) -> String {
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap_or("unknown").to_string();
+        let data = field.bytes().await.unwrap();
+        println!("Field `{}`: {} bytes", name, data.len());
+    }
+    "uploaded".to_string()
+}
+```
+
+**OpenAPI integration:** records the request body as `multipart/form-data` with an opaque binary schema. For detailed field-level documentation, extend the generated spec manually.
+
+## `State<T>`
+
+Re-exported from `axum::extract::State`. Provides access to shared application state. Does not appear in the generated OpenAPI spec.
+
+```rust
+use fastrs::State;
+
+#[derive(Clone)]
+struct AppState {
+    db_url: String,
+}
+
+async fn handler(State(state): State<AppState>) -> String {
+    format!("Connected to {}", state.db_url)
+}
+```
+
+Pass state to the app with `App::with_state`:
+
+```rust
+let app = App::new()
+    .with_state(AppState { db_url: "postgres://localhost/mydb".to_string() });
+```
+
+## Error responses
+
+All extractors convert failures into JSON error responses:
+
+| Status | Cause |
+|--------|-------|
+| **400** | `Page` with zero values, missing or unparseable `Header`, `Multipart` parse failure |
+| **422** | `Json` or `Query` validation failure (body contains field-level errors) |
+
+See [Error handling](/api/error-handling) for the full `ApiError` enum and custom error patterns.
+
+## Authentication
+
+The `Bearer<T>` extractor handles token-based authentication. See [Authentication](/api/authentication) for details.

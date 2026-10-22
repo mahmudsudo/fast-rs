@@ -1,0 +1,100 @@
+---
+title: Response types
+description: Return JSON bodies, 201 Created, and 204 No Content responses with automatic OpenAPI documentation.
+---
+
+fastrs provides response wrappers that set the correct HTTP status code and update the generated OpenAPI spec. You can use `Json<T>` for standard 200 responses, `Created<T>` for 201, and `NoContent` for 204.
+
+## `Json<T>` as a responder
+
+When `Json<T>` is used as a return type (not an extractor), it serializes `T` to JSON and responds with status **200**. `T` must implement `Serialize`.
+
+```rust
+use fastrs::{get, Json, Path};
+use serde::Serialize;
+
+#[derive(Serialize, fastrs::OpenApi)]
+struct User {
+    id: u32,
+    name: String,
+}
+
+#[get("/users/{id}")]
+async fn get_user(Path(id): Path<u32>) -> Json<User> {
+    Json(User { id, name: "Alice".into() })
+}
+```
+
+**OpenAPI integration:** documents a `200` response with an `application/json` media type and the schema derived from `T`.
+
+## `Created<T>`
+
+Wraps an inner response and overrides its status code to **201 Created**. The most common pattern is `Created<Json<T>>`, which returns a JSON body with a 201 status.
+
+```rust
+use fastrs::{post, Created, Json};
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Deserialize, Validate, fastrs::OpenApi)]
+struct CreateTodo {
+    #[validate(length(min = 1))]
+    title: String,
+}
+
+#[derive(Serialize, fastrs::OpenApi)]
+struct Todo {
+    id: i64,
+    title: String,
+}
+
+#[post("/todos")]
+async fn create_todo(body: Json<CreateTodo>) -> Created<Json<Todo>> {
+    let todo = Todo { id: 1, title: body.title.clone() };
+    Created(Json(todo))
+}
+```
+
+**OpenAPI integration:** takes the inner type's OpenAPI responses and remaps status `200` to `201`. All other status codes pass through unchanged. For example, `Created<Json<Todo>>` documents a `201` response with the `Todo` schema instead of `200`.
+
+### Combining with `Result`
+
+`Created<T>` works with `Result` to document both success and error responses:
+
+```rust
+use fastrs::{post, ApiError, Created, Json};
+
+#[post("/todos")]
+async fn create_todo(body: Json<CreateTodo>) -> Result<Created<Json<Todo>>, ApiError> {
+    let todo = Todo { id: 1, title: body.title.clone() };
+    Ok(Created(Json(todo)))
+}
+```
+
+The generated OpenAPI operation includes the `201` response from `Created<Json<Todo>>` and the error responses from `ApiError`.
+
+## `NoContent`
+
+Returns an empty body with status **204 No Content**. Useful for delete operations or updates that do not return a body.
+
+```rust
+use fastrs::{delete, ApiError, NoContent, Path};
+
+#[delete("/todos/{id}")]
+async fn delete_todo(Path(id): Path<i64>) -> Result<NoContent, ApiError> {
+    // ... perform deletion ...
+    Ok(NoContent)
+}
+```
+
+**OpenAPI integration:** documents a `204` response with an empty content map and the description "No Content".
+
+## Summary
+
+| Type | Status | OpenAPI effect |
+|------|--------|----------------|
+| `Json<T>` | 200 | `200` response with `application/json` schema from `T` |
+| `Created<T>` | 201 | Remaps inner `200` response to `201`, preserves other statuses |
+| `NoContent` | 204 | `204` response with empty content |
+
+All three types implement `OpenApiResponder`, so routes registered with `App::route` pick up their response documentation automatically. When wrapped in `Result<T, E>` where both `T` and `E` implement `OpenApiResponder`, success and error responses are merged into a single operation.

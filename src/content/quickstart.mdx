@@ -1,47 +1,127 @@
 ---
 title: Quickstart
-description: Guide a new reader through one useful workflow and show them how to verify it.
+description: Install fastrs, write a validated route with auto-generated OpenAPI docs, and run the server.
 ---
 
-A strong quickstart produces one meaningful result. Replace the placeholders
-below with the shortest supported path for your product.
+Build and run a small API with request validation and interactive OpenAPI docs in under five minutes.
 
 ## Before you begin
 
-List only the requirements needed for this workflow:
+- Rust toolchain (edition 2024 support, i.e. Rust 1.85+). Install from [rustup.rs](https://rustup.rs).
 
-- An account or credential, when required
-- A supported runtime, device, browser, or operating system
-- Permission to create or change the resource used in the example
+## Create a project
 
-<Steps>
-  <Step title="Install the required tool">
-    Give readers one recommended installation command.
+```bash
+cargo new my-api && cd my-api
+```
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Add the minimum configuration">
-    Include only the values needed for the first successful run.
+Replace the generated `Cargo.toml` with the following. The `fastrs` facade crate re-exports everything from `fastrs-core` and `fastrs-macros`, so it is the only framework dependency you need.
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Complete the first task">
-    Use a realistic example that produces an observable result.
+```toml
+[package]
+name = "my-api"
+version = "0.1.0"
+edition = "2024"
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-  <Step title="Verify the result">
-    State exactly what the reader should see and how to recover when it does not appear.
-  </Step>
-</Steps>
+[dependencies]
+fastrs = { git = "https://github.com/mahmudsudo/fast_rs" }
+serde = { version = "1.0", features = ["derive"] }
+validator = { version = "0.18", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
 
-## Choose the next task
+## Write the API
 
-Link to the guide that naturally follows this result. Avoid ending the reader’s
-journey with a generic list of every feature.
+Replace `src/main.rs` with the code below. It defines a `CreateUser` request validated at deserialization time, a `UserResponse`, and two routes whose OpenAPI schemas are derived at compile time.
+
+```rust
+use fastrs::{get, post, Json, Path, OpenApi, Created};
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Deserialize, Validate, OpenApi)]
+struct CreateUser {
+    #[validate(email)]
+    email: String,
+    #[validate(length(min = 8))]
+    password: String,
+}
+
+#[derive(Serialize, OpenApi)]
+struct UserResponse {
+    id: u64,
+    email: String,
+}
+
+#[post("/users")]
+async fn create_user(body: Json<CreateUser>) -> Created<Json<UserResponse>> {
+    Created(Json(UserResponse { id: 1, email: body.email.clone() }))
+}
+
+#[get("/users/{id}")]
+async fn get_user(Path(id): Path<u64>) -> Json<UserResponse> {
+    Json(UserResponse { id, email: "user@example.com".into() })
+}
+
+#[tokio::main]
+async fn main() {
+    fastrs::App::new()
+        .route(create_user)
+        .route(get_user)
+        .serve_docs_at("/docs")
+        .run("0.0.0.0:8000")
+        .await;
+}
+```
+
+Key points:
+
+- `#[derive(OpenApi)]` generates an OpenAPI schema from the struct fields. It picks up validator attributes such as `#[validate(email)]` and `#[validate(length(min = N))]`.
+- `Json<T>` deserializes the request body and runs `T::validate()` automatically, returning a 422 response on failure.
+- `Created` wraps any response and overrides the status code to 201.
+- `serve_docs_at("/docs")` serves a Swagger UI page and the raw spec at `/docs/openapi.json`.
+
+## Run and verify
+
+```bash
+cargo run
+```
+
+Once you see the server listening, verify the routes:
+
+```bash
+# Create a user (returns 201)
+curl -s -X POST http://localhost:8000/users \
+  -H "Content-Type: application/json" \
+  -d ‘{"email":"alice@example.com","password":"secure123"}’
+
+# Fetch a user (returns 200)
+curl -s http://localhost:8000/users/1
+```
+
+Open [http://localhost:8000/docs](http://localhost:8000/docs) in a browser to see the interactive Swagger UI with the generated OpenAPI 3.0.3 spec.
+
+To confirm validation works, send an invalid body:
+
+```bash
+curl -s -X POST http://localhost:8000/users \
+  -H "Content-Type: application/json" \
+  -d ‘{"email":"not-an-email","password":"short"}’
+```
+
+The server returns a 422 response with field-level error details.
+
+## Enable the htmx feature
+
+If you plan to use htmx extractors and response helpers, enable the optional `htmx` feature in `Cargo.toml`:
+
+```toml
+[dependencies]
+fastrs = { git = "https://github.com/mahmudsudo/fast_rs", features = ["htmx"] }
+```
+
+This makes `HxRequest`, `HxTarget`, `HxTrigger`, `HxRedirect`, and `HxRefresh` importable from `fastrs`.
+
+## Next steps
+
+Learn how to add shared application state and connect a database in the [state and database guide](/guides/state-and-database).

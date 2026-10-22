@@ -1,0 +1,99 @@
+---
+title: Deployment
+description: Configure host and port, understand graceful shutdown behavior, and build a Docker image for a fastrs application.
+---
+
+This guide covers the three things you need to ship a fastrs service: runtime address configuration, graceful shutdown, and a container image.
+
+## Configure host and port
+
+`App::run` accepts an address string such as `"0.0.0.0:8000"`. To make the address configurable at deploy time, read environment variables and fall back to defaults:
+
+```rust
+use fastrs::{get, Json, App};
+
+#[get("/")]
+async fn index() -> Json<String> {
+    Json("ok".into())
+}
+
+#[tokio::main]
+async fn main() {
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".into());
+    let addr = format!("{host}:{port}");
+
+    App::new()
+        .route(index)
+        .run(&addr)
+        .await;
+}
+```
+
+Set the variables when you launch the process:
+
+```bash
+HOST=127.0.0.1 PORT=3000 cargo run
+```
+
+In a container or orchestrator, pass them through the environment block of your deployment manifest.
+
+## Graceful shutdown
+
+`App::run` installs a shutdown signal handler before starting the Axum server. When the process receives a signal, the listener stops accepting new connections and all in-flight requests are allowed to finish before the process exits.
+
+Supported signals:
+
+| Signal | Platforms |
+|---|---|
+| SIGINT (Ctrl+C) | All platforms |
+| SIGTERM | Unix only |
+
+On non-Unix platforms SIGTERM is not available, so only SIGINT triggers shutdown.
+
+This behavior relies on the Tokio async runtime. If a handler blocks the runtime thread (for example with `std::thread::sleep` or a long synchronous computation), the shutdown future cannot make progress and in-flight requests will stall. Keep blocking work off the runtime by using `tokio::task::spawn_blocking` or a dedicated thread pool.
+
+No additional configuration is required. The shutdown handler is always active when you call `run`.
+
+## Build a Docker image
+
+A multi-stage build keeps the final image small by compiling in a Rust builder stage and copying only the binary into a minimal runtime image.
+
+Create a `Dockerfile` in your project root:
+
+```dockerfile
+# Stage 1: build
+FROM rust:1.85-slim AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+# Stage 2: runtime
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/my-api /usr/local/bin/my-api
+
+ENV HOST=0.0.0.0
+ENV PORT=8000
+EXPOSE 8000
+
+ENTRYPOINT ["my-api"]
+```
+
+Replace `my-api` with the binary name defined in your `Cargo.toml` package.
+
+Build and run:
+
+```bash
+docker build -t my-api .
+docker run -p 8000:8000 my-api
+```
+
+Override the port at runtime:
+
+```bash
+docker run -p 3000:3000 -e PORT=3000 my-api
+```
+
+Because the container runtime sends SIGTERM on `docker stop`, the graceful shutdown handler catches it on Linux and lets in-flight requests complete before the process exits.

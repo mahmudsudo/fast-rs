@@ -1,0 +1,169 @@
+---
+title: OpenAPI Schema Generation
+---
+
+fastrs automatically generates an OpenAPI 3.0.3 specification from your route handlers and types. You define schemas with `#[derive(OpenApi)]`, and the framework wires them into the spec through the `OpenApiType`, `OpenApiExtractor`, and `OpenApiResponder` traits. Call `serve_docs_at` on your `App` to serve Swagger UI and the raw JSON spec.
+
+## `OpenApi` struct
+
+The top-level registry that collects all path operations:
+
+```rust
+pub struct OpenApi {
+    pub openapi: String,                              // defaults to "3.0.3"
+    pub info: Info,                                    // defaults below
+    pub paths: BTreeMap<String, BTreeMap<String, Operation>>,
+}
+```
+
+`Info` defaults:
+
+| Field | Default value |
+|---|---|
+| `title` | `"fastrs API"` |
+| `version` | `"0.1.0"` |
+
+`App::new()` creates an empty `OpenApi` with these defaults. Every call to `.route()` inserts an `Operation` into `paths` keyed by the HTTP method and path.
+
+## `Schema` fields
+
+The `Schema` struct represents a JSON Schema object in the generated spec:
+
+```rust
+pub struct Schema {
+    pub type_: Option<String>,
+    pub format: Option<String>,
+    pub min_length: Option<usize>,
+    pub max_length: Option<usize>,
+    pub properties: BTreeMap<String, Schema>,
+    pub required: Vec<String>,
+}
+```
+
+Fields that are `None` or empty are omitted from the serialized JSON.
+
+## Built-in `OpenApiType` implementations
+
+fastrs provides `OpenApiType` implementations for common Rust types:
+
+| Rust type | `type_` | Notes |
+|---|---|---|
+| `String` | `"string"` | |
+| `u32`, `u64`, `i32`, `i64` | `"integer"` | |
+| `bool` | `"boolean"` | |
+| `Option<T>` | Same as `T` | Delegates to the inner type's schema |
+| `Vec<T>` | `"array"` | |
+| `serde_json::Value` | `"object"` | |
+
+## `#[derive(OpenApi)]` macro
+
+Generates an `OpenApiType` implementation for a named struct. Every field becomes a required property in the schema, with its type resolved through the field type's own `OpenApiType` implementation.
+
+```rust
+use fastrs::OpenApi;
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Deserialize, Serialize, Validate, OpenApi)]
+struct CreateUser {
+    #[validate(length(min = 1))]
+    name: String,
+    #[validate(email)]
+    email: String,
+    age: u32,
+}
+```
+
+This produces a schema equivalent to:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name":  { "type": "string", "min_length": 1 },
+    "email": { "type": "string", "format": "email" },
+    "age":   { "type": "integer" }
+  },
+  "required": ["name", "email", "age"]
+}
+```
+
+### Recognized `#[validate(...)]` attributes
+
+| Attribute | Schema effect |
+|---|---|
+| `#[validate(email)]` | Sets `format` to `"email"` |
+| `#[validate(length(min = N))]` | Sets `min_length` to `N` |
+
+Other `validator` attributes are not currently reflected in the generated schema.
+
+## Traits
+
+### `OpenApiType`
+
+Returns the JSON Schema for a type:
+
+```rust
+pub trait OpenApiType {
+    fn schema() -> Schema;
+}
+```
+
+Implement this manually for types that `#[derive(OpenApi)]` does not cover.
+
+### `OpenApiExtractor`
+
+Modifies an `Operation` to document a request extractor (query parameters, headers, request bodies):
+
+```rust
+pub trait OpenApiExtractor {
+    fn modify_operation(op: &mut Operation);
+}
+```
+
+The route attribute macros (`#[get(...)]`, `#[post(...)]`, etc.) call `OpenApiExtractor::modify_operation` for every non-path extractor parameter in the handler signature. Built-in extractors such as `Json<T>`, `Query<T>`, `Page`, `Bearer<T>`, `Header<T, V>`, and `Multipart` each provide their own implementation. See the [Extractors](/api/extractors) page for details.
+
+### `OpenApiResponder`
+
+Modifies an `Operation` to document the handler's response:
+
+```rust
+pub trait OpenApiResponder {
+    fn modify_operation(op: &mut Operation);
+}
+```
+
+The route macros call `OpenApiResponder::modify_operation` for the handler's return type (unless it is an `impl Trait` return). Built-in responders include `Json<T>`, `Created<T>`, `NoContent`, `ApiError`, and `Result<T, E>` where both `T` and `E` implement `OpenApiResponder`.
+
+## Serving Swagger UI
+
+Call `serve_docs_at` on your `App` to expose the specification and a Swagger UI page:
+
+```rust
+use fastrs::App;
+
+let app = App::new()
+    .route(list_users)
+    .route(create_user)
+    .serve_docs_at("/docs");
+```
+
+This registers two endpoints:
+
+| Path | Content |
+|---|---|
+| `/docs` | Swagger UI HTML page |
+| `/docs/openapi.json` | Raw OpenAPI 3.0.3 JSON |
+
+The OpenAPI JSON is serialized once when `serve_docs_at` is called, so it captures all routes registered before that point. Register your routes before calling `serve_docs_at`.
+
+## How route macros populate the spec
+
+When you annotate a handler with a route macro such as `#[get("/users/{id}")]`, the macro:
+
+1. Detects `Path<T>` parameters and adds them as required path parameters with a schema derived from `T`.
+2. Calls `OpenApiExtractor::modify_operation` for every other extractor parameter (`Json<T>`, `Query<T>`, `Bearer<T>`, etc.).
+3. Calls `OpenApiResponder::modify_operation` for the return type, unless it is an `impl Trait` type.
+4. Wraps the result into a `RouteDef` containing the path, HTTP method, Axum handler, and the populated `Operation`.
+
+When you pass that `RouteDef` to `App::route()`, the operation is inserted into the `OpenApi` registry under the converted path (with `{param}` rewritten to `:param` for Axum routing, while the OpenAPI paths keep the `{param}` style).

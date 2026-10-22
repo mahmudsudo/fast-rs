@@ -1,53 +1,118 @@
 ---
 title: Authentication
-description: How to authenticate requests, and how to document your own scheme.
+description: Implement bearer token authentication with the AuthVerifier trait and Bearer extractor.
 ---
 
-The Sample Posts API is intentionally public: no key, token, or header is
-required, so every request in this reference works the moment you press
-**Send**.
+fastrs provides token-based authentication through two pieces: the `AuthVerifier<T>` trait on your application state and the `Bearer<T>` extractor on your handler. Together they read the `Authorization` header, call your verification logic, and either inject the authenticated value into the handler or reject the request with a 401.
 
-Your API almost certainly is not public. This page shows how to document the
-two most common schemes so readers always know exactly what to put in the
-request — replace it with the scheme your API uses.
+## The `AuthVerifier` trait
 
-## Documenting a bearer token
+Implement `AuthVerifier<T>` on your shared state type. The trait has one async method that receives the raw token string and returns either the verified value or an error that converts into `ApiError`.
 
-Show the header exactly as readers must send it, then where the token comes
-from:
+```rust
+#[async_trait]
+pub trait AuthVerifier<T>: Send + Sync + 'static {
+    type Error: Into<ApiError>;
+
+    async fn verify(&self, token: &str) -> Result<T, Self::Error>;
+}
+```
+
+`T` is whatever your verification produces: a user ID, a claims struct, a session object. The associated `Error` type must satisfy `Into<ApiError>`, so you can return `ApiError` directly or define a custom error that implements `IntoApiError`.
+
+## The `Bearer` extractor
+
+`Bearer<T>` is a request-parts extractor. When a handler includes `Bearer<T>` in its parameters the extractor:
+
+1. Reads the `Authorization` header. If missing, returns **401**.
+2. Strips the `Bearer ` prefix. If the header does not start with `Bearer `, returns **401**.
+3. Calls `state.verify(token)`. If verification fails, the error is converted via `Into<ApiError>` and returned as the corresponding HTTP status.
+4. On success, injects the verified `T` into the handler.
+
+Because the extractor calls `state.verify()`, the application state type `S` must implement `AuthVerifier<T>`.
+
+## Full example
+
+The example below uses `axum::async_trait`. Add `axum` as a direct dependency in your `Cargo.toml` alongside `fastrs`:
+
+```toml
+[dependencies]
+fastrs = "0.1"
+axum = "0.7"
+```
+
+```rust
+use axum::async_trait;
+use fastrs::{get, App, ApiError, AuthVerifier, Bearer, Json, OpenApi, State};
+use serde::Serialize;
+
+// The value produced after successful verification.
+#[derive(Clone, Serialize, OpenApi)]
+struct UserId(String);
+
+// Application state that knows how to verify tokens.
+#[derive(Clone)]
+struct AppState {
+    secret: String,
+}
+
+#[async_trait]
+impl AuthVerifier<UserId> for AppState {
+    type Error = ApiError;
+
+    async fn verify(&self, token: &str) -> Result<UserId, ApiError> {
+        if token == self.secret {
+            Ok(UserId("user-42".to_string()))
+        } else {
+            Err(ApiError::Unauthorized("Invalid token".to_string()))
+        }
+    }
+}
+
+#[get("/me")]
+async fn me(Bearer(user): Bearer<UserId>) -> Json<UserId> {
+    Json(user)
+}
+
+#[tokio::main]
+async fn main() {
+    let state = AppState {
+        secret: "my-secret-token".to_string(),
+    };
+
+    App::new()
+        .route(me)
+        .with_state(state)
+        .run("0.0.0.0:3000")
+        .await;
+}
+```
+
+A valid request:
 
 ```bash
-curl --request GET \
-  --url 'https://api.yourproduct.com/v1/posts' \
-  --header 'Authorization: Bearer YOUR_API_TOKEN'
+curl -H "Authorization: Bearer my-secret-token" http://localhost:3000/me
 ```
 
-## Documenting an API key
+A rejected request receives a `401` JSON error:
 
-```bash
-curl --request GET \
-  --url 'https://api.yourproduct.com/v1/posts' \
-  --header 'X-Api-Key: YOUR_API_KEY'
+```json
+{"message": "Invalid token"}
 ```
 
-## Declare the scheme in OpenAPI
+## Error responses
 
-Add a security scheme to `openapi.yaml` and the generated endpoint pages will
-show the requirement — and the playground will prompt for the credential —
-automatically:
+| Situation | Status | Body |
+|-----------|--------|------|
+| `Authorization` header missing | **401** | `{"message":"Missing Authorization header"}` |
+| Header value is not valid UTF-8 | **400** | `{"message":"Invalid Authorization header encoding"}` |
+| Header present but not prefixed with `Bearer ` | **401** | `{"message":"Authorization header must use Bearer token"}` |
+| `verify()` returns `Err` | Status determined by the error's `Into<ApiError>` conversion | Error-specific JSON body |
 
-```yaml
-components:
-  securitySchemes:
-    bearerAuth:
-      type: http
-      scheme: bearer
-security:
-  - bearerAuth: []
-```
+## OpenAPI integration
 
-<Tip>
-  Tell readers where to create and revoke credentials, how long they live, and
-  what happens when one expires. Those three answers prevent most
-  authentication support tickets.
-</Tip>
+When a route uses `Bearer<T>`, the generated OpenAPI operation includes a required `Authorization` header parameter with a string schema. The route attribute macros (`#[get]`, `#[post]`, etc.) detect `Bearer<T>` in the handler signature and add an `AuthVerifier` trait bound to the generated route definition automatically.
+
+## Custom header authentication
+
+For schemes that do not use `Authorization: Bearer`, use the `Header<T, V>` extractor with the `HeaderName` trait. See [Extractors](/api/extractors) for details.

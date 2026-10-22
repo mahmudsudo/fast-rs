@@ -1,0 +1,162 @@
+---
+title: HTMX Integration
+description: Use HTMX extractors and responders in fastrs routes with automatic OpenAPI header documentation.
+---
+
+The `htmx` feature re-exports three extractors from `axum-htmx` 0.6 and adds two custom responders. Every type implements OpenAPI traits, so HTMX headers appear in your generated spec automatically.
+
+## Enable the feature
+
+Add the `htmx` feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+fastrs = { version = "0.1.0", features = ["htmx"] }
+```
+
+This activates the optional `axum-htmx` dependency in `fastrs-core`.
+
+## Extractors
+
+All three extractors are re-exported from `axum-htmx`. Each implements `OpenApiExtractor` and records an optional header parameter in the OpenAPI operation.
+
+### `HxRequest`
+
+A boolean that is `true` when the request includes an `HX-Request` header. Use it to distinguish HTMX partial requests from full-page loads.
+
+```rust
+use fastrs::{App, HxRequest, get};
+use fastrs::axum::response::{Html, IntoResponse};
+
+#[get("/todos")]
+async fn todos_page(HxRequest(is_htmx): HxRequest) -> impl IntoResponse {
+    let fragment = r#"<ul id="todo-list"><li>Buy milk</li></ul>"#;
+
+    if is_htmx {
+        // HTMX request: return only the HTML fragment
+        Html(fragment.to_string()).into_response()
+    } else {
+        // Normal request: return a full page
+        let page = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><script src="https://unpkg.com/htmx.org@2.0.4"></script></head>
+<body>
+    <button hx-get="/todos" hx-target="#todo-list" hx-swap="outerHTML">
+        Refresh
+    </button>
+    {fragment}
+</body>
+</html>"#
+        );
+        Html(page).into_response()
+    }
+}
+```
+
+**OpenAPI integration:** adds an optional `HX-Request` header parameter with a boolean schema.
+
+### `HxTarget`
+
+Contains the `id` of the target element from the `HX-Target` request header.
+
+```rust
+use fastrs::HxTarget;
+
+async fn handle(HxTarget(target): HxTarget) -> String {
+    format!("Target element: {}", target.unwrap_or_default())
+}
+```
+
+**OpenAPI integration:** adds an optional `HX-Target` header parameter with a string schema.
+
+### `HxTrigger`
+
+Contains the `id` of the element that triggered the request, read from the `HX-Trigger` request header.
+
+```rust
+use fastrs::HxTrigger;
+
+async fn handle(HxTrigger(trigger): HxTrigger) -> String {
+    format!("Triggered by: {}", trigger.unwrap_or_default())
+}
+```
+
+**OpenAPI integration:** adds an optional `HX-Trigger` header parameter with a string schema.
+
+## Responders
+
+### `HxRedirect`
+
+Sets the `HX-Redirect` response header, telling the HTMX client to navigate to a new URL.
+
+```rust
+use fastrs::{HxRedirect, get};
+
+#[get("/redirect-demo")]
+async fn redirect_demo() -> HxRedirect {
+    HxRedirect("/todos".to_string())
+}
+```
+
+**OpenAPI integration:** documents a `302` response with description "HTMX redirect (HX-Redirect header)".
+
+### `HxRefresh`
+
+Sets the `HX-Refresh` response header. When `true`, the HTMX client performs a full page refresh.
+
+```rust
+use fastrs::{HxRefresh, get};
+
+#[get("/refresh")]
+async fn refresh() -> HxRefresh {
+    HxRefresh(true)
+}
+```
+
+**OpenAPI integration:** documents a `200` response with description "HTMX page refresh (HX-Refresh header)".
+
+## Putting it together
+
+A minimal HTMX application that serves a page with a partial-update endpoint and a redirect:
+
+```rust
+use fastrs::{App, HxRedirect, HxRequest, get};
+use fastrs::axum::response::{Html, IntoResponse};
+
+#[get("/todos")]
+async fn todos_page(HxRequest(is_htmx): HxRequest) -> impl IntoResponse {
+    let fragment = r#"<ul id="todo-list"><li>Buy milk</li><li>Walk the dog</li></ul>"#;
+
+    if is_htmx {
+        Html(fragment.to_string()).into_response()
+    } else {
+        let page = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head><script src="https://unpkg.com/htmx.org@2.0.4"></script></head>
+<body>
+    <h1>Todos</h1>
+    <button hx-get="/todos" hx-target="#todo-list" hx-swap="outerHTML">Refresh</button>
+    {fragment}
+</body>
+</html>"#
+        );
+        Html(page).into_response()
+    }
+}
+
+#[get("/redirect-demo")]
+async fn redirect_demo() -> HxRedirect {
+    HxRedirect("/todos".to_string())
+}
+
+#[tokio::main]
+async fn main() {
+    let app = App::new()
+        .route(todos_page)
+        .route(redirect_demo);
+
+    app.run("0.0.0.0:8002").await;
+}
+```

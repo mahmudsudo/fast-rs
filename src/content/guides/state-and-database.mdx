@@ -1,0 +1,207 @@
+---
+title: State and database integration
+description: Share application state across handlers and integrate a database pool with proper error mapping.
+---
+
+fastrs has no built-in database dependency. Any type that satisfies `Clone + Send + Sync + 'static` can be shared across handlers as application state. This guide shows how to wire up a database connection pool and map database errors into API responses.
+
+## Provide state with `with_state`
+
+`App::with_state(state)` consumes an `App<S>` and returns an `App<()>`. After this call the state type is fixed and every handler that extracts `State<S>` receives a clone of the value you passed in.
+
+```rust
+use fastrs::App;
+
+#[derive(Clone)]
+struct AppState {
+    db: String,
+}
+
+let app = App::new()
+    .route(my_handler)
+    .with_state(AppState { db: "...".into() });
+```
+
+Because `with_state` returns `App<()>`, you must register all routes that depend on state _before_ calling it. Methods that do not depend on state, such as `health_check`, `serve_docs_at`, and `run`, work on `App<()>` and can be chained afterward.
+
+## Extract state in handlers
+
+Use `fastrs::State` to access the shared value inside a handler:
+
+```rust
+use fastrs::{get, Json, State};
+
+#[get("/items")]
+async fn list_items(
+    State(state): State<AppState>,
+) -> Json<String> {
+    Json(format!("connected to {}", state.db))
+}
+```
+
+## Use a database pool as state
+
+A connection pool from any async database library works as long as it is `Clone + Send + Sync + 'static`. The sqlx `PgPool` and `SqlitePool` types both satisfy these bounds.
+
+### SQLite example
+
+```rust
+use fastrs::App;
+use sqlx::sqlite::SqlitePool;
+
+#[tokio::main]
+async fn main() {
+    let pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("Failed to connect to SQLite");
+
+    // Run migrations or create tables before starting
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to create table");
+
+    App::new()
+        .route(create_todo)
+        .route(list_todos)
+        .with_state(pool)
+        .run("0.0.0.0:8001")
+        .await;
+}
+```
+
+### Postgres example
+
+```rust
+use fastrs::App;
+use sqlx::PgPool;
+
+#[tokio::main]
+async fn main() {
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5432/fastrs_todo".to_string()
+    });
+
+    let pool = PgPool::connect(&db_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+    App::new()
+        .route(create_todo)
+        .route(list_todos)
+        .route(get_todo)
+        .route(update_todo)
+        .route(delete_todo)
+        .with_state(pool)
+        .serve_docs_at("/docs")
+        .run("0.0.0.0:8002")
+        .await;
+}
+```
+
+## Map database errors with an AppError wrapper
+
+Rust's orphan rule prevents implementing `From<sqlx::Error>` directly for `ApiError` because both types are defined outside your crate. The standard workaround is a newtype that wraps `ApiError` and implements the necessary conversions.
+
+The wrapper needs four trait implementations:
+
+1. `From<sqlx::Error>` to convert database errors.
+2. `From<ApiError>` so you can still construct API errors explicitly.
+3. `IntoResponse` to produce the HTTP response (delegates to `ApiError`).
+4. `OpenApiResponder` to document error responses in the OpenAPI spec (delegates to `ApiError`).
+
+```rust
+use fastrs::{ApiError, OpenApiResponder, Operation};
+
+#[derive(Debug)]
+pub struct AppError(pub ApiError);
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        match err {
+            sqlx::Error::RowNotFound => {
+                AppError(ApiError::NotFound("Not found".to_string()))
+            }
+            _ => AppError(ApiError::InternalServerError(err.to_string())),
+        }
+    }
+}
+
+impl From<ApiError> for AppError {
+    fn from(err: ApiError) -> Self {
+        AppError(err)
+    }
+}
+
+impl fastrs::axum::response::IntoResponse for AppError {
+    fn into_response(self) -> fastrs::axum::response::Response {
+        self.0.into_response()
+    }
+}
+
+impl OpenApiResponder for AppError {
+    fn modify_operation(op: &mut Operation) {
+        ApiError::modify_operation(op);
+    }
+}
+```
+
+## Use the `?` operator in handlers
+
+With `AppError` in place, handlers return `Result<T, AppError>` and can use `?` on both sqlx calls and explicit `ApiError` construction:
+
+```rust
+use fastrs::{get, post, Json, Path, State, Created};
+
+#[post("/todos")]
+async fn create_todo(
+    State(pool): State<sqlx::PgPool>,
+    body: Json<CreateTodoRequest>,
+) -> Result<Created<Json<TodoResponse>>, AppError> {
+    let row = sqlx::query_as::<_, TodoResponse>(
+        "INSERT INTO todos (title, done) VALUES ($1, $2) RETURNING id, title, done",
+    )
+    .bind(&body.title)
+    .bind(body.done)
+    .fetch_one(&pool)
+    .await?; // sqlx::Error -> AppError via From
+
+    Ok(Created(Json(row)))
+}
+
+#[get("/todos/{id}")]
+async fn get_todo(
+    Path(id): Path<i64>,
+    State(pool): State<sqlx::PgPool>,
+) -> Result<Json<TodoResponse>, AppError> {
+    let todo = sqlx::query_as::<_, TodoResponse>(
+        "SELECT id, title, done FROM todos WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await?
+    .ok_or_else(|| {
+        ApiError::NotFound(format!("Todo {} not found", id))
+    })?; // ApiError -> AppError via From
+
+    Ok(Json(todo))
+}
+```
+
+The `Created` wrapper overrides the success status to 201 and documents it in the OpenAPI spec. See [Responses](/api/responses) for the full list of response wrappers.
+
+## State bounds summary
+
+| Requirement | Why |
+|---|---|
+| `Clone` | Axum clones state into each handler invocation |
+| `Send + Sync` | Handlers run on the Tokio runtime across threads |
+| `'static` | State must outlive any individual request |
+
+Database pool types from sqlx, deadpool, bb8, and similar libraries satisfy all four bounds out of the box.

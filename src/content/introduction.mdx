@@ -1,45 +1,84 @@
 ---
 title: Introduction
-description: Give readers a clear path from their first question to a result they can verify.
-mode: home
+description: fastrs is a thin ergonomics layer on Axum 0.7 that adds compile-time OpenAPI generation, automatic request validation, and minimal boilerplate for Rust web APIs.
 ---
 
-<Hero
-  title="Build documentation around the reader"
-  subtitle="Start with a useful first result, organize what follows, and publish every format from one reviewable source."
-  primaryLabel="Get started"
-  primaryHref="/quickstart"
-  secondaryLabel="Publish your docs"
-  secondaryHref="/guides/create-a-site"
-/>
+fastrs brings FastAPI-style developer experience to Rust. It wraps
+[Axum 0.7](https://docs.rs/axum/0.7) with proc macros that generate OpenAPI
+schemas and validate requests at compile time, so your handlers stay short and
+your binary pays no runtime reflection cost.
 
-## Build the reader journey
+## Crate structure
 
-Begin with the task that brings most readers to your documentation, then make
-the next useful step obvious.
+The project is a Cargo workspace with three crates.
+
+| Crate | Role |
+|---|---|
+| `fastrs` | Facade crate. Re-exports everything from `fastrs-core` and `fastrs-macros`. Add this to your `[dependencies]` for the simplest setup. |
+| `fastrs-core` | Runtime library. Contains `App`, extractors, error types, response wrappers, middleware helpers, and the OpenAPI registry. Built on Axum 0.7, Tower 0.5, and Serde. |
+| `fastrs-macros` | Proc-macro crate. Provides `#[derive(OpenApi)]` for compile-time schema generation and route attribute macros (`#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]`). |
+
+Depend on the facade and you get everything in one import:
+
+```rust
+// Cargo.toml
+[dependencies]
+fastrs = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+validator = { version = "0.18", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+## What it provides
+
+- **Compile-time OpenAPI docs.** `#[derive(OpenApi)]` reads struct fields and
+  `#[validate(...)]` attributes at compile time to produce a schema baked into
+  the binary. `App::serve_docs_at` serves Swagger UI from that schema with no
+  startup scan.
+- **Automatic request validation.** `Json<T>`, `Query<T>`, and other extractors
+  deserialize and call `Validate::validate()` before your handler runs. Invalid
+  input returns a structured 422 response immediately.
+- **Route macros.** `#[get("/path")]`, `#[post("/path")]`, and siblings generate
+  a `RouteDef` that registers the Axum handler and its OpenAPI operation in one
+  step.
+- **Built-in middleware.** CORS, tracing, request IDs, and rate limiting are
+  available as one-liner `App` methods, and `App::layer` exposes the full Tower
+  middleware stack.
+- **Auth and pagination extractors.** `Bearer<T>` with a pluggable
+  `AuthVerifier` trait and `Page` with default/bounds handling are included out
+  of the box.
+- **HTMX support.** Enable the optional `htmx` feature for `HxRequest`,
+  `HxTarget`, `HxTrigger` extractors and `HxRedirect`, `HxRefresh` responders.
+
+## Comparison with Axum and FastAPI
+
+| Feature | fastrs | Axum | FastAPI |
+|---|---|---|---|
+| Boilerplate | Minimal (like FastAPI) | High (manual validation and schema wiring) | Minimal |
+| OpenAPI generation | Compile-time via macros | Not built-in (third-party crates such as `utoipa`) | Runtime via reflection |
+| Request validation | Automatic, compile-time | Manual inside handler | Automatic |
+| Runtime overhead | Zero | Zero | High (Python) |
+| Routing abstraction | Returns a raw `axum::Router` | Native | Custom |
+| Auth support | `Bearer` extractor with `AuthVerifier` trait | Manual | OpenAPI auth schemes |
+| Pagination | First-class `Page` extractor | Manual query parsing | Built-in |
+
+## License
+
+fastrs is dual-licensed under MIT OR Apache-2.0.
+
+## Next steps
 
 <CardGroup cols="2">
-  <Card title="Write your quickstart" icon="party-horn" href="/quickstart">
-    Turn prerequisites, setup, one realistic task, and verification into a short path.
+  <Card title="Quickstart" icon="party-horn" href="/quickstart">
+    Set up a project, define a validated endpoint, and run Swagger UI in minutes.
   </Card>
-  <Card title="Organize your navigation" icon="grid-round" href="/customization">
-    Group related tasks and references around how people use your product.
+  <Card title="App builder" icon="grid-round" href="/api/app-builder">
+    Configure routes, middleware, state, and graceful shutdown with the App API.
   </Card>
-  <Card title="Document your API" icon="code-simple" href="/api">
-    Replace `openapi.yaml` to publish browsable endpoint docs with a live playground.
+  <Card title="Extractors" icon="code-simple" href="/api/extractors">
+    Learn how Json, Query, Path, Bearer, Page, Header, and Multipart work.
   </Card>
-  <Card title="Learn the Thally workflow" icon="wrench" href="/guides/create-a-site">
-    Create, publish, and update sites from the Cloud dashboard, the CLI, or your AI tools.
+  <Card title="OpenAPI" icon="wrench" href="/api/openapi">
+    Understand how schemas, operations, and Swagger UI are generated at compile time.
   </Card>
 </CardGroup>
-
-## Publish from one source
-
-Thally turns the same reviewed content into HTML, search, agent discovery files,
-Markdown mirrors, and a read-only MCP surface — so people and AI tools read the
-same, current answer. Add only the locales your readers need.
-
-<Note type="info" title="Start with the product, not the template">
-  Replace this page with the questions, terminology, and workflows your readers
-  already use. Keep `docs.json` focused on the path between those tasks.
-</Note>

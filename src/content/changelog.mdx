@@ -1,15 +1,69 @@
 ---
 title: Changelog
-description: Record product changes that alter how readers use the documented experience.
+description: All notable changes to fastrs, organized by release.
 ---
 
-## v0.1.0
+This changelog covers the `fastrs`, `fastrs-core`, and `fastrs-macros` crates. The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-The first published version of this documentation.
+## 0.1.0
 
-- A task-focused introduction and quickstart
-- Browsable API documentation generated from `openapi.yaml`
-- Agent-readable discovery files and a read-only MCP endpoint
+Initial release. All three workspace crates (`fastrs` 0.1.0, `fastrs-core` 0.1.0, `fastrs-macros` 0.1.0) ship together.
 
-Replace this entry with changes your readers need to understand. Lead with the
-impact, then link to the guide or reference that explains the new behavior.
+### Added
+
+#### App builder and routing
+
+- `App` builder with `route`, `nest`, `with_state`, and `into_router` methods for composing Axum routers with automatic OpenAPI registration. See [App builder](/api/app-builder).
+- Route attribute macros `#[get]`, `#[post]`, `#[put]`, `#[patch]`, and `#[delete]` that generate `RouteDef` values and wire up OpenAPI metadata. See [Routing](/api/routing).
+- `App::run` starts the HTTP server with graceful shutdown (SIGINT on all platforms, SIGTERM on Unix). In-flight requests complete before exit.
+
+#### Extractors
+
+- `Json` extractor that deserializes and validates request bodies, returning 422 on validation failure. See [Extractors](/api/extractors).
+- `Query` extractor with automatic validation.
+- `Path` extractor for URL path parameters.
+- `Page` extractor for pagination (`?page=&limit=`), defaulting to page 1 and limit 20.
+- `Header` extractor for type-safe header parsing via the `HeaderName` trait.
+- `Bearer` extractor for `Authorization: Bearer` token verification via the `AuthVerifier` trait. See [Authentication](/api/authentication).
+- `Multipart` extractor for `multipart/form-data` file uploads.
+- `State` re-exported from Axum.
+
+#### Error handling
+
+- `ApiError` enum with `NotFound` (404), `Unauthorized` (401), `BadRequest` (400), `InternalServerError` (500), `Validation` (422), and `Custom` variants. All variants serialize to a JSON `ErrorResponse`. See [Error handling](/api/error-handling).
+- `IntoApiError` trait with a blanket `From` impl so custom error types convert to `ApiError` automatically.
+- Validation errors return `{"errors":[{"field":"...","message":"..."}]}` at status 422.
+
+#### Response wrappers
+
+- `Created` wrapper that overrides the response status to 201. See [Responses](/api/responses).
+- `NoContent` type that returns 204 with an empty body.
+
+#### Middleware
+
+- Generic `layer` method on `App` for attaching any Tower layer. See [Middleware](/api/middleware).
+- `with_cors` convenience method for `CorsLayer`.
+- `with_tracing` convenience method for `TraceLayer`.
+- `with_rate_limit` method using `RateLimitConfig`. Rate limiting is backed by `rate_rs` with an in-memory store and a single global bucket (not per-client).
+- `with_request_id` method that sets and propagates a UUID v4 `x-request-id` header.
+
+#### Health checks
+
+- `health_check` method that registers a GET endpoint returning `{"status":"ok","version":"<crate version>"}`. See [Health checks and versioning](/guides/health-checks-and-versioning).
+- `health_check_with` method for custom async health checks, returning 503 on failure.
+
+#### OpenAPI
+
+- Automatic OpenAPI 3.0.3 spec generation from route macros, extractors, and response types. See [OpenAPI](/api/openapi).
+- `serve_docs_at` method that serves a Swagger UI page and the raw `openapi.json`.
+- `#[derive(OpenApi)]` proc macro that generates `OpenApiType` impls, recognizing `#[validate(email)]` and `#[validate(length(min = N))]` attributes.
+
+#### HTMX (optional `htmx` feature)
+
+- Re-exports `HxRequest`, `HxTarget`, and `HxTrigger` extractors from `axum-htmx` with OpenAPI header documentation. See [HTMX](/api/htmx).
+- `HxRedirect` responder that sets the `HX-Redirect` header.
+- `HxRefresh` responder that sets the `HX-Refresh` header.
+
+#### CI
+
+- GitHub Actions workflow running `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test --workspace` on pushes and pull requests to `main`.
