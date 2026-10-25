@@ -56,7 +56,8 @@
           "pages": [
             "guides/state-and-database",
             "guides/health-checks-and-versioning",
-            "guides/deployment"
+            "guides/deployment",
+            "guides/validation-docs"
           ]
         },
         {
