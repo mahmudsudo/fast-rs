@@ -1,0 +1,84 @@
+---
+title: Validate requests and publish API docs
+navTitle: Validation and docs
+description: Enforce rules on incoming JSON, read the error responses, and see the same rules in the generated OpenAPI spec.
+---
+
+fastrs runs your `validator` rules before your handler executes, and copies the same rules into the OpenAPI spec. This guide shows both sides using the API from the [Quickstart](/quickstart).
+
+## Before you start
+
+Finish the [Quickstart](/quickstart) and keep `cargo run` going in a terminal.
+
+## Add rules to a request type
+
+Validation rules are ordinary `validator` attributes on a struct that derives `Deserialize`, `Validate`, and `OpenApi`:
+
+```rust
+#[derive(Deserialize, Validate, OpenApi)]
+struct CreateUser {
+    #[validate(email)]
+    email: String,
+    #[validate(length(min = 8))]
+    password: String,
+}
+```
+
+Take the struct as `Json<CreateUser>` in your handler. Your handler body only runs when every rule passes, so you never check the fields by hand.
+
+## See a validation failure
+
+Send a body that breaks both rules:
+
+```bash
+curl -i -X POST localhost:8000/users \
+  -H 'content-type: application/json' \
+  -d '{"email":"nope","password":"short"}'
+```
+
+You get `422 Unprocessable Entity` with one entry per failing field:
+
+```json
+{
+  "errors": [
+    { "field": "email", "message": "validation failed: email" },
+    { "field": "password", "message": "validation failed: length" }
+  ]
+}
+```
+
+Your client can map each `field` to a form input. The `message` names the failed rule rather than the expected value, so show your own wording to end users.
+
+## Know the other error responses
+
+| Request | Status | What happened |
+| --- | --- | --- |
+| Valid body | `201 Created` | The handler ran and returned `Created(...)` |
+| Rule broken | `422` | Validation failed before the handler |
+| `GET /users/abc` | `400 Bad Request` | The path segment could not be parsed as `u64` |
+
+## Return your own errors
+
+Use `ApiError` for failures that only your handler can detect, such as a missing record. It maps variants to status codes, for example `ApiError::NotFound("User not found".to_string())` returns a 404.
+
+## Read the rules in the generated docs
+
+The OpenAPI spec is served under your docs path. With `.serve_docs_at("/docs")` it lives at `/docs/openapi.json`:
+
+```bash
+curl -s localhost:8000/docs/openapi.json
+```
+
+For `POST /users`, the request schema includes `"format": "email"` for `email` and a minimum length of 8 for `password`, and marks both fields as required. Open `/docs` to see the same information in Swagger UI, where you can send test requests.
+
+> **Note:** The spec is generated at compile time. After you change a rule, restart with `cargo run` to see the update in the docs.
+
+## Troubleshooting
+
+- **A rule seems ignored.** Confirm the handler parameter is `Json<YourType>` from `fastrs`, not `axum::Json`. Only the fastrs extractor runs validation.
+- **`/openapi.json` returns 404.** The spec path follows the docs path. Request `/docs/openapi.json`.
+- **Compile error about `Validate`.** Check that `validator` is pinned to `0.18` in `Cargo.toml`.
+
+## Next steps
+
+- Browse the [examples](https://github.com/mahmudsudo/fast_rs/tree/main/examples) in the repository.
